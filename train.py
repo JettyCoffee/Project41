@@ -7,10 +7,11 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingLR, LambdaLR
 import time
 import json
 import os
+import math
 from typing import Dict, Tuple, List
 from tqdm import tqdm
 
@@ -19,9 +20,30 @@ from rnn_model import RNNSeq2Seq, count_parameters
 from transformer_model import TransformerSeq2Seq
 
 
+def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps: int, num_training_steps: int):
+    """
+    创建带有Warmup的Cosine学习率调度器
+    Args:
+        optimizer: 优化器
+        num_warmup_steps: 预热步数
+        num_training_steps: 总训练步数
+    Returns:
+        学习率调度器
+    """
+    def lr_lambda(current_step: int):
+        if current_step < num_warmup_steps:
+            # 线性预热
+            return float(current_step) / float(max(1, num_warmup_steps))
+        # Cosine退火
+        progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+    
+    return LambdaLR(optimizer, lr_lambda)
+
+
 def train_epoch(model: nn.Module, dataloader, optimizer, criterion, 
                 device: torch.device, clip: float = 1.0, 
-                model_type: str = "rnn") -> float:
+                model_type: str = "rnn", scheduler=None) -> float:
     """
     训练一个epoch
     Args:
@@ -32,6 +54,7 @@ def train_epoch(model: nn.Module, dataloader, optimizer, criterion,
         device: 设备
         clip: 梯度裁剪阈值
         model_type: 模型类型 ("rnn" 或 "transformer")
+        scheduler: 学习率调度器（步级别，用于Transformer的warmup）
     Returns:
         平均损失
     """
@@ -68,6 +91,11 @@ def train_epoch(model: nn.Module, dataloader, optimizer, criterion,
         torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
         
         optimizer.step()
+        
+        # 步级别学习率调度（用于Transformer的warmup+cosine）
+        if scheduler is not None:
+            scheduler.step()
+        
         epoch_loss += loss.item()
     
     return epoch_loss / len(dataloader)
@@ -115,7 +143,7 @@ def evaluate(model: nn.Module, dataloader, criterion, device: torch.device,
 
 def train_model(model: nn.Module, train_loader, val_loader, device: torch.device,
                 model_type: str, num_epochs: int = 20, learning_rate: float = 0.001,
-                save_dir: str = "checkpoints") -> Dict:
+                save_dir: str = "checkpoints", warmup_ratio: float = 0.1) -> Dict:
     """
     完整的训练流程
     Args:
@@ -127,6 +155,7 @@ def train_model(model: nn.Module, train_loader, val_loader, device: torch.device
         num_epochs: 训练轮数
         learning_rate: 学习率
         save_dir: 模型保存目录
+        warmup_ratio: 预热比例（用于Transformer）
     Returns:
         训练历史记录
     """
@@ -138,8 +167,20 @@ def train_model(model: nn.Module, train_loader, val_loader, device: torch.device
     # 优化器
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     
-    # 学习率调度器
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
+    # 根据模型类型选择不同的学习率调度策略
+    total_steps = len(train_loader) * num_epochs
+    warmup_steps = int(total_steps * warmup_ratio)
+    
+    if model_type == "transformer":
+        # Transformer: 使用Warmup + Cosine退火（步级别调度）
+        scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
+        epoch_scheduler = None
+        print(f"使用Warmup+Cosine调度: {warmup_steps}步预热, {total_steps}步总训练")
+    else:
+        # RNN: 使用ReduceLROnPlateau + Cosine（epoch级别调度）
+        scheduler = None
+        epoch_scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=learning_rate * 0.01)
+        print(f"使用Cosine退火调度: T_max={num_epochs}")
     
     # 创建保存目录
     os.makedirs(save_dir, exist_ok=True)
@@ -168,17 +209,19 @@ def train_model(model: nn.Module, train_loader, val_loader, device: torch.device
     for epoch in range(num_epochs):
         epoch_start_time = time.time()
         
-        # 训练
+        # 训练（传入步级别调度器给Transformer）
         train_loss = train_epoch(model, train_loader, optimizer, criterion, 
-                                  device, model_type=model_type)
+                                  device, model_type=model_type, scheduler=scheduler)
         
         # 验证
         val_loss = evaluate(model, val_loader, criterion, device, model_type=model_type)
         
         epoch_time = time.time() - epoch_start_time
         
-        # 更新学习率
-        scheduler.step(val_loss)
+        # RNN使用epoch级别的Cosine调度
+        if epoch_scheduler is not None:
+            epoch_scheduler.step()
+        
         current_lr = optimizer.param_groups[0]['lr']
         
         # 记录历史
@@ -317,7 +360,7 @@ def main():
         num_encoder_layers=3,
         num_decoder_layers=3,
         dim_feedforward=512,
-        dropout=0.1
+        dropout=0.3  # 提高dropout防止过拟合（小数据集）
     )
     
     transformer_history = train_model(

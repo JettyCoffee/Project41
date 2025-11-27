@@ -165,15 +165,17 @@ class TransformerSeq2Seq(nn.Module):
         return output, None
     
     def translate(self, src: torch.Tensor, src_lens: torch.Tensor = None, 
-                  max_len: int = 50, bos_idx: int = 2, eos_idx: int = 3) -> Tuple[torch.Tensor, list]:
+                  max_len: int = 50, bos_idx: int = 2, eos_idx: int = 3,
+                  repetition_penalty: float = 1.2) -> Tuple[torch.Tensor, list]:
         """
-        翻译（推理时使用，自回归生成）
+        翻译（推理时使用，自回归生成，带重复惩罚）
         Args:
             src: 源序列 (batch, src_len)
             src_lens: 源序列长度（可选）
             max_len: 最大生成长度
             bos_idx: BOS token索引
             eos_idx: EOS token索引
+            repetition_penalty: 重复惩罚系数（>1.0时惩罚重复）
         Returns:
             outputs: 生成的token索引 (batch, gen_len)
             attentions: 注意力权重列表（用于可视化）
@@ -191,10 +193,17 @@ class TransformerSeq2Seq(nn.Module):
             # 初始化目标序列（以BOS开始）
             tgt_indices = torch.full((batch_size, 1), bos_idx, dtype=torch.long, device=device)
             
+            # 维护finished掩码，记录哪些句子已经生成了EOS
+            finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+            
             # 存储注意力权重
             attentions = []
             
             for _ in range(max_len):
+                # 如果所有句子都已完成，提前退出
+                if finished.all():
+                    break
+                    
                 tgt_len = tgt_indices.size(1)
                 tgt_mask = self.generate_square_subsequent_mask(tgt_len, device)
                 
@@ -209,59 +218,31 @@ class TransformerSeq2Seq(nn.Module):
                 
                 # 获取最后一个位置的预测
                 next_token_logits = self.fc_out(output[:, -1, :])
+                
+                # 应用重复惩罚
+                if repetition_penalty != 1.0:
+                    for i in range(batch_size):
+                        if not finished[i]:
+                            # 获取已生成的token
+                            prev_tokens = tgt_indices[i].unique()
+                            # 对已出现的token进行惩罚
+                            for token in prev_tokens:
+                                if next_token_logits[i, token] > 0:
+                                    next_token_logits[i, token] /= repetition_penalty
+                                else:
+                                    next_token_logits[i, token] *= repetition_penalty
+                
                 next_token = next_token_logits.argmax(dim=-1, keepdim=True)
+                
+                # 对于已完成的句子，用PAD填充
+                next_token = next_token.masked_fill(finished.unsqueeze(1), 0)  # PAD_IDX = 0
                 
                 tgt_indices = torch.cat([tgt_indices, next_token], dim=1)
                 
-                # 检查是否全部生成EOS
-                if (next_token.squeeze(-1) == eos_idx).all():
-                    break
+                # 更新finished状态
+                finished = finished | (next_token.squeeze(-1) == eos_idx)
         
         return tgt_indices, attentions
-    
-    def get_attention_weights(self, src: torch.Tensor, tgt: torch.Tensor) -> list:
-        """
-        获取注意力权重用于可视化
-        Args:
-            src: 源序列 (batch, src_len)
-            tgt: 目标序列 (batch, tgt_len)
-        Returns:
-            attention_weights: 交叉注意力权重列表
-        """
-        self.eval()
-        attention_weights = []
-        
-        with torch.no_grad():
-            src_key_padding_mask = self.create_src_mask(src)
-            tgt_mask, tgt_key_padding_mask = self.create_tgt_mask(tgt)
-            
-            src_emb = self.pos_encoder(self.src_embedding(src) * math.sqrt(self.d_model))
-            tgt_emb = self.pos_encoder(self.tgt_embedding(tgt) * math.sqrt(self.d_model))
-            
-            # 编码
-            memory = self.transformer.encoder(src_emb, src_key_padding_mask=src_key_padding_mask)
-            
-            # 逐层获取解码器的交叉注意力
-            x = tgt_emb
-            for layer in self.transformer.decoder.layers:
-                # Self-attention
-                x2 = layer.self_attn(x, x, x, attn_mask=tgt_mask, key_padding_mask=tgt_key_padding_mask)[0]
-                x = layer.norm1(x + layer.dropout1(x2))
-                
-                # Cross-attention (获取权重)
-                x2, attn_weight = layer.multihead_attn(
-                    x, memory, memory, 
-                    key_padding_mask=src_key_padding_mask,
-                    need_weights=True,
-                    average_attn_weights=True
-                )
-                attention_weights.append(attn_weight)
-                
-                x = layer.norm2(x + layer.dropout2(x2))
-                x2 = layer.linear2(layer.dropout(layer.activation(layer.linear1(x))))
-                x = layer.norm3(x + layer.dropout3(x2))
-        
-        return attention_weights
 
 
 def count_parameters(model: nn.Module) -> int:
@@ -285,7 +266,7 @@ if __name__ == "__main__":
         num_encoder_layers=3,
         num_decoder_layers=3,
         dim_feedforward=512,
-        dropout=0.1
+        dropout=0.3  # 提高dropout防止过拟合
     )
     
     print(f"Transformer Seq2Seq模型参数量: {count_parameters(model):,}")
