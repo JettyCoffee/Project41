@@ -358,37 +358,51 @@ def main():
     
     # ==================== 评估Transformer模型 ====================
     print("\n" + "=" * 60)
-    print("评估Transformer模型 (BPE分词)")
+    print("评估Transformer模型 (共享BPE分词)")
     print("=" * 60)
     
-    transformer_model_path = os.path.join(CHECKPOINT_DIR, "transformer_best.pt")
+    # 尝试加载平均模型，如果不存在则加载最佳模型
+    transformer_averaged_path = os.path.join(CHECKPOINT_DIR, "transformer_averaged.pt")
+    transformer_best_path = os.path.join(CHECKPOINT_DIR, "transformer_best.pt")
+    transformer_model_path = transformer_averaged_path if os.path.exists(transformer_averaged_path) else transformer_best_path
+    
+    # 尝试加载共享词表，如果不存在则尝试旧的分离词表
+    shared_bpe_path = os.path.join(CHECKPOINT_DIR, "shared_bpe_tokenizer.json")
     src_bpe_path = os.path.join(CHECKPOINT_DIR, "src_bpe_tokenizer.json")
     tgt_bpe_path = os.path.join(CHECKPOINT_DIR, "tgt_bpe_tokenizer.json")
     
-    if os.path.exists(transformer_model_path) and os.path.exists(src_bpe_path) and os.path.exists(tgt_bpe_path):
+    if os.path.exists(transformer_model_path) and (os.path.exists(shared_bpe_path) or (os.path.exists(src_bpe_path) and os.path.exists(tgt_bpe_path))):
         # 加载BPE分词器
         print("\n加载BPE分词器...")
-        src_tokenizer = BPETokenizerWrapper()
-        tgt_tokenizer = BPETokenizerWrapper()
-        src_tokenizer.load(src_bpe_path)
-        tgt_tokenizer.load(tgt_bpe_path)
+        if os.path.exists(shared_bpe_path):
+            print("使用共享词表")
+            tokenizer = BPETokenizerWrapper()
+            tokenizer.load(shared_bpe_path)
+            vocab_size = tokenizer.get_vocab_size()
+        else:
+            print("使用分离词表（兼容模式）")
+            tokenizer = BPETokenizerWrapper()
+            tokenizer.load(tgt_bpe_path)
+            src_tokenizer_tmp = BPETokenizerWrapper()
+            src_tokenizer_tmp.load(src_bpe_path)
+            vocab_size = src_tokenizer_tmp.get_vocab_size()  # 这里假设旧版本src和tgt一样大
         
         # 创建Transformer测试数据集
         test_dataset_tf = BPE_Transformer(
             os.path.join(DATA_DIR, "test.jsonl"),
-            src_tokenizer=src_tokenizer,
-            tgt_tokenizer=tgt_tokenizer
+            tokenizer=tokenizer
         )
         from torch.utils.data import DataLoader
         test_loader_tf = DataLoader(test_dataset_tf, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
         
         # 加载模型
+        print(f"加载模型: {os.path.basename(transformer_model_path)}")
         transformer_model = load_model(
             transformer_model_path, "transformer", 
-            src_tokenizer.get_vocab_size(), tgt_tokenizer.get_vocab_size(), DEVICE
+            vocab_size, vocab_size, DEVICE
         )
         transformer_results, trans_cands, trans_refs = evaluate_model(
-            transformer_model, test_loader_tf, tgt_tokenizer, DEVICE, "transformer", tokenizer_type="bpe"
+            transformer_model, test_loader_tf, tokenizer, DEVICE, "transformer", tokenizer_type="bpe"
         )
         all_results["Transformer"] = transformer_results
         all_samples["Transformer"] = {"candidates": trans_cands[:20], "references": trans_refs[:20]}

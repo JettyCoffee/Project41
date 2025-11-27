@@ -92,6 +92,9 @@ class TransformerSeq2Seq(nn.Module):
         # 输出投影层
         self.fc_out = nn.Linear(d_model, tgt_vocab_size)
         
+        # Weight Tying: 共享 Decoder Embedding 和输出层权重
+        self.fc_out.weight = self.tgt_embedding.weight
+        
         # 初始化参数
         self._init_weights()
     
@@ -166,16 +169,16 @@ class TransformerSeq2Seq(nn.Module):
     
     def translate(self, src: torch.Tensor, src_lens: torch.Tensor = None, 
                   max_len: int = 50, bos_idx: int = 2, eos_idx: int = 3,
-                  repetition_penalty: float = 1.2) -> Tuple[torch.Tensor, list]:
+                  beam_size: int = 5) -> Tuple[torch.Tensor, list]:
         """
-        翻译（推理时使用，自回归生成，带重复惩罚）
+        翻译（推理时使用，Beam Search）
         Args:
             src: 源序列 (batch, src_len)
             src_lens: 源序列长度（可选）
             max_len: 最大生成长度
             bos_idx: BOS token索引
             eos_idx: EOS token索引
-            repetition_penalty: 重复惩罚系数（>1.0时惩罚重复）
+            beam_size: beam宽度
         Returns:
             outputs: 生成的token索引 (batch, gen_len)
             attentions: 注意力权重列表（用于可视化）
@@ -184,65 +187,132 @@ class TransformerSeq2Seq(nn.Module):
         batch_size = src.size(0)
         device = src.device
         
+        # 为简化实现，batch_size=1时使用beam search，否则退化为greedy
+        if batch_size > 1:
+            return self._greedy_decode(src, max_len, bos_idx, eos_idx)
+        
         with torch.no_grad():
             # 编码源序列
             src_key_padding_mask = self.create_src_mask(src)
             src_emb = self.pos_encoder(self.src_embedding(src) * math.sqrt(self.d_model))
             memory = self.transformer.encoder(src_emb, src_key_padding_mask=src_key_padding_mask)
             
-            # 初始化目标序列（以BOS开始）
-            tgt_indices = torch.full((batch_size, 1), bos_idx, dtype=torch.long, device=device)
+            # 扩展memory以适应beam search
+            memory = memory.repeat(beam_size, 1, 1)  # (beam_size, src_len, d_model)
+            src_key_padding_mask = src_key_padding_mask.repeat(beam_size, 1)  # (beam_size, src_len)
             
-            # 维护finished掩码，记录哪些句子已经生成了EOS
+            # 初始化beam
+            # 每个beam: (score, sequence)
+            beams = [(0.0, [bos_idx])]
+            complete_beams = []
+            
+            for step in range(max_len):
+                if len(beams) == 0:
+                    break
+                    
+                all_candidates = []
+                
+                # 批量处理所有当前beam
+                current_seqs = [b[1] for b in beams]
+                current_scores = [b[0] for b in beams]
+                
+                # 将序列转换为tensor
+                max_seq_len = max(len(s) for s in current_seqs)
+                tgt_batch = torch.zeros((len(current_seqs), max_seq_len), dtype=torch.long, device=device)
+                for i, seq in enumerate(current_seqs):
+                    tgt_batch[i, :len(seq)] = torch.tensor(seq, dtype=torch.long, device=device)
+                
+                tgt_len = tgt_batch.size(1)
+                tgt_mask = self.generate_square_subsequent_mask(tgt_len, device)
+                tgt_emb = self.pos_encoder(self.tgt_embedding(tgt_batch) * math.sqrt(self.d_model))
+                
+                # 使用前len(beams)个memory副本
+                output = self.transformer.decoder(
+                    tgt_emb,
+                    memory[:len(beams)],
+                    tgt_mask=tgt_mask,
+                    memory_key_padding_mask=src_key_padding_mask[:len(beams)]
+                )
+                
+                # 获取最后一个位置的log概率
+                logits = self.fc_out(output[:, -1, :])  # (num_beams, vocab_size)
+                log_probs = torch.log_softmax(logits, dim=-1)
+                
+                # 为每个beam扩展候选
+                for i, (score, seq) in enumerate(beams):
+                    if seq[-1] == eos_idx:
+                        complete_beams.append((score, seq))
+                        continue
+                    
+                    # 获取top-k候选
+                    topk_log_probs, topk_indices = log_probs[i].topk(beam_size)
+                    
+                    for j in range(beam_size):
+                        token = topk_indices[j].item()
+                        new_score = score + topk_log_probs[j].item()
+                        new_seq = seq + [token]
+                        all_candidates.append((new_score, new_seq))
+                
+                # 选择top-k候选
+                all_candidates.sort(key=lambda x: x[0], reverse=True)
+                beams = all_candidates[:beam_size]
+                
+                # 如果所有beam都已完成
+                if all(b[1][-1] == eos_idx for b in beams):
+                    complete_beams.extend(beams)
+                    break
+            
+            # 如果没有完整的beam，使用当前beam
+            if not complete_beams:
+                complete_beams = beams
+            
+            # 选择得分最高的完整序列
+            # 使用长度归一化
+            best_beam = max(complete_beams, key=lambda x: x[0] / len(x[1]))
+            best_seq = best_beam[1]
+            
+            # 转换为tensor
+            result = torch.tensor([best_seq], dtype=torch.long, device=device)
+            
+        return result, []
+    
+    def _greedy_decode(self, src: torch.Tensor, max_len: int, 
+                       bos_idx: int, eos_idx: int) -> Tuple[torch.Tensor, list]:
+        """
+        Greedy解码（用于batch_size > 1的情况）
+        """
+        batch_size = src.size(0)
+        device = src.device
+        
+        with torch.no_grad():
+            src_key_padding_mask = self.create_src_mask(src)
+            src_emb = self.pos_encoder(self.src_embedding(src) * math.sqrt(self.d_model))
+            memory = self.transformer.encoder(src_emb, src_key_padding_mask=src_key_padding_mask)
+            
+            tgt_indices = torch.full((batch_size, 1), bos_idx, dtype=torch.long, device=device)
             finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
             
-            # 存储注意力权重
-            attentions = []
-            
             for _ in range(max_len):
-                # 如果所有句子都已完成，提前退出
                 if finished.all():
                     break
                     
                 tgt_len = tgt_indices.size(1)
                 tgt_mask = self.generate_square_subsequent_mask(tgt_len, device)
-                
                 tgt_emb = self.pos_encoder(self.tgt_embedding(tgt_indices) * math.sqrt(self.d_model))
                 
                 output = self.transformer.decoder(
-                    tgt_emb, 
-                    memory,
+                    tgt_emb, memory,
                     tgt_mask=tgt_mask,
                     memory_key_padding_mask=src_key_padding_mask
                 )
                 
-                # 获取最后一个位置的预测
                 next_token_logits = self.fc_out(output[:, -1, :])
-                
-                # 应用重复惩罚
-                if repetition_penalty != 1.0:
-                    for i in range(batch_size):
-                        if not finished[i]:
-                            # 获取已生成的token
-                            prev_tokens = tgt_indices[i].unique()
-                            # 对已出现的token进行惩罚
-                            for token in prev_tokens:
-                                if next_token_logits[i, token] > 0:
-                                    next_token_logits[i, token] /= repetition_penalty
-                                else:
-                                    next_token_logits[i, token] *= repetition_penalty
-                
                 next_token = next_token_logits.argmax(dim=-1, keepdim=True)
-                
-                # 对于已完成的句子，用PAD填充
-                next_token = next_token.masked_fill(finished.unsqueeze(1), 0)  # PAD_IDX = 0
-                
+                next_token = next_token.masked_fill(finished.unsqueeze(1), 0)
                 tgt_indices = torch.cat([tgt_indices, next_token], dim=1)
-                
-                # 更新finished状态
                 finished = finished | (next_token.squeeze(-1) == eos_idx)
         
-        return tgt_indices, attentions
+        return tgt_indices, []
 
 
 def count_parameters(model: nn.Module) -> int:

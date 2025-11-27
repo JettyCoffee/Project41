@@ -251,18 +251,16 @@ class SpaCy_RNN(Dataset):
 class BPE_Transformer(Dataset):
     """
     Multi30k翻译数据集 - Transformer版本
-    使用BPE子词分词
+    使用共享BPE子词分词（源语言和目标语言使用同一个分词器）
     """
     
-    def __init__(self, data_path: str, src_tokenizer: BPETokenizerWrapper = None,
-                 tgt_tokenizer: BPETokenizerWrapper = None, train_tokenizer: bool = False,
-                 vocab_size: int = 16000):
+    def __init__(self, data_path: str, tokenizer: BPETokenizerWrapper = None,
+                 train_tokenizer: bool = False, vocab_size: int = 8000):
         """
         初始化数据集
         Args:
             data_path: jsonl数据文件路径
-            src_tokenizer: 源语言BPE分词器（英语）
-            tgt_tokenizer: 目标语言BPE分词器（德语）
+            tokenizer: 共享BPE分词器
             train_tokenizer: 是否训练分词器
             vocab_size: BPE词汇表大小
         """
@@ -278,15 +276,15 @@ class BPE_Transformer(Dataset):
                 self.src_texts.append(item['en'])
                 self.tgt_texts.append(item['de'])
         
-        # 训练或使用提供的BPE分词器
+        # 训练或使用提供的共享BPE分词器
         if train_tokenizer:
-            self.src_tokenizer = BPETokenizerWrapper(vocab_size=vocab_size)
-            self.tgt_tokenizer = BPETokenizerWrapper(vocab_size=vocab_size)
-            self.src_tokenizer.train(self.src_texts)
-            self.tgt_tokenizer.train(self.tgt_texts)
+            self.tokenizer = BPETokenizerWrapper(vocab_size=vocab_size)
+            # 合并源语言和目标语言文本训练共享词表
+            all_texts = self.src_texts + self.tgt_texts
+            self.tokenizer.train(all_texts)
+            print(f"使用共享词表，词汇表大小: {self.tokenizer.get_vocab_size()}")
         else:
-            self.src_tokenizer = src_tokenizer
-            self.tgt_tokenizer = tgt_tokenizer
+            self.tokenizer = tokenizer
     
     def __len__(self):
         return len(self.data)
@@ -297,8 +295,8 @@ class BPE_Transformer(Dataset):
         Returns:
             (源语言索引张量, 目标语言索引张量)
         """
-        src_indices = self.src_tokenizer.encode(self.src_texts[idx])
-        tgt_indices = self.tgt_tokenizer.encode(self.tgt_texts[idx])
+        src_indices = self.tokenizer.encode(self.src_texts[idx])
+        tgt_indices = self.tokenizer.encode(self.tgt_texts[idx])
         return torch.tensor(src_indices), torch.tensor(tgt_indices)
     
     def get_raw_pair(self, idx) -> Tuple[str, str]:
@@ -329,7 +327,7 @@ def collate_fn(batch: List[Tuple[torch.Tensor, torch.Tensor]]) -> Tuple[torch.Te
 
 def create_dataloaders(data_dir: str, batch_size: int = 32, min_freq: int = 2, 
                        num_workers: int = 0, model_type: str = "rnn",
-                       bpe_vocab_size: int = 16000) -> Tuple:
+                       bpe_vocab_size: int = 8000) -> Tuple:
     """
     创建训练、验证、测试DataLoader
     Args:
@@ -337,11 +335,11 @@ def create_dataloaders(data_dir: str, batch_size: int = 32, min_freq: int = 2,
         batch_size: 批大小
         min_freq: 最小词频（仅用于RNN的Vocabulary）
         num_workers: 数据加载线程数
-        model_type: 模型类型，"rnn"使用spaCy分词，"transformer"使用BPE分词
-        bpe_vocab_size: BPE词汇表大小（仅用于Transformer）
+        model_type: 模型类型，"rnn"使用spaCy分词，"transformer"使用共享BPE分词
+        bpe_vocab_size: BPE词汇表大小（仅用于Transformer，默认8000）
     Returns:
         对于RNN: (train_loader, val_loader, test_loader, src_vocab, tgt_vocab)
-        对于Transformer: (train_loader, val_loader, test_loader, src_tokenizer, tgt_tokenizer)
+        对于Transformer: (train_loader, val_loader, test_loader, tokenizer, tokenizer)
     """
     train_path = os.path.join(data_dir, 'train.jsonl')
     val_path = os.path.join(data_dir, 'val.jsonl')
@@ -360,16 +358,16 @@ def create_dataloaders(data_dir: str, batch_size: int = 32, min_freq: int = 2,
         vocab_sizes = (len(src_vocab), len(tgt_vocab))
         
     elif model_type == "transformer":
-        print(f"使用BPE分词器 (Transformer模型), 词汇表大小: {bpe_vocab_size}")
+        print(f"使用共享BPE分词器 (Transformer模型), 词汇表大小: {bpe_vocab_size}")
         train_dataset = BPE_Transformer(train_path, train_tokenizer=True, vocab_size=bpe_vocab_size)
-        src_tokenizer = train_dataset.src_tokenizer
-        tgt_tokenizer = train_dataset.tgt_tokenizer
+        tokenizer = train_dataset.tokenizer
         
-        val_dataset = BPE_Transformer(val_path, src_tokenizer=src_tokenizer, tgt_tokenizer=tgt_tokenizer)
-        test_dataset = BPE_Transformer(test_path, src_tokenizer=src_tokenizer, tgt_tokenizer=tgt_tokenizer)
+        val_dataset = BPE_Transformer(val_path, tokenizer=tokenizer)
+        test_dataset = BPE_Transformer(test_path, tokenizer=tokenizer)
         
-        tokenizer_info = (src_tokenizer, tgt_tokenizer)
-        vocab_sizes = (src_tokenizer.get_vocab_size(), tgt_tokenizer.get_vocab_size())
+        # 返回同一个分词器两次（为了保持接口一致性）
+        tokenizer_info = (tokenizer, tokenizer)
+        vocab_sizes = (tokenizer.get_vocab_size(), tokenizer.get_vocab_size())
     else:
         raise ValueError(f"不支持的模型类型: {model_type}")
     
@@ -431,10 +429,10 @@ if __name__ == "__main__":
         break
     
     print("\n" + "=" * 60)
-    print("测试Transformer数据加载器 (BPE分词)")
+    print("测试Transformer数据加载器 (共享BPE分词)")
     print("=" * 60)
-    train_loader_t, val_loader_t, test_loader_t, src_tokenizer, tgt_tokenizer = create_dataloaders(
-        data_dir, model_type="transformer", bpe_vocab_size=16000
+    train_loader_t, val_loader_t, test_loader_t, tokenizer, _ = create_dataloaders(
+        data_dir, model_type="transformer", bpe_vocab_size=8000
     )
     
     # 打印一个批次的示例
@@ -445,8 +443,8 @@ if __name__ == "__main__":
         
         # 解码第一个样本
         print(f"\n示例解码:")
-        print(f"  源语言: {src_tokenizer.decode(src[0].tolist())}")
-        print(f"  目标语言: {tgt_tokenizer.decode(tgt[0].tolist())}")
+        print(f"  源语言: {tokenizer.decode(src[0].tolist())}")
+        print(f"  目标语言: {tokenizer.decode(tgt[0].tolist())}")
         
         # 显示BPE分词结果
         raw_src, raw_tgt = train_loader_t.dataset.get_raw_pair(0)

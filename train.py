@@ -161,11 +161,15 @@ def train_model(model: nn.Module, train_loader, val_loader, device: torch.device
     """
     model = model.to(device)
     
-    # 损失函数（忽略padding）
-    criterion = nn.CrossEntropyLoss(ignore_index=PAD_IDX)
+    # 损失函数（忽略padding，使用Label Smoothing提升泛化能力）
+    label_smoothing = 0.1 if model_type == "transformer" else 0.0
+    criterion = nn.CrossEntropyLoss(ignore_index=PAD_IDX, label_smoothing=label_smoothing)
     
-    # 优化器
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    # 优化器（Transformer使用SOTA参数）
+    if model_type == "transformer":
+        optimizer = optim.Adam(model.parameters(), lr=learning_rate, betas=(0.9, 0.98), eps=1e-9)
+    else:
+        optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     
     # 根据模型类型选择不同的学习率调度策略
     total_steps = len(train_loader) * num_epochs
@@ -184,6 +188,10 @@ def train_model(model: nn.Module, train_loader, val_loader, device: torch.device
     
     # 创建保存目录
     os.makedirs(save_dir, exist_ok=True)
+    
+    # 用于 Checkpoint Averaging 的存储
+    checkpoint_states = []  # 保存最后几个epoch的模型状态
+    avg_checkpoints = 5  # 平均最后5个checkpoint
     
     # 训练历史
     history = {
@@ -243,12 +251,35 @@ def train_model(model: nn.Module, train_loader, val_loader, device: torch.device
                 'val_loss': val_loss,
             }, os.path.join(save_dir, f'{model_type}_best.pt'))
         
+        # Checkpoint Averaging: 保存最后几个epoch的模型状态
+        if model_type == "transformer":
+            # 深拷贝当前模型状态
+            state_copy = {k: v.clone() for k, v in model.state_dict().items()}
+            checkpoint_states.append(state_copy)
+            if len(checkpoint_states) > avg_checkpoints:
+                checkpoint_states.pop(0)
+        
         # 打印进度
         print(f"Epoch {epoch+1}/{num_epochs} | "
               f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
               f"Time: {epoch_time:.1f}s | LR: {current_lr:.6f}")
     
     history["total_training_time"] = time.time() - total_start_time
+    
+    # Checkpoint Averaging: 对最后几个epoch的模型权重进行平均
+    if model_type == "transformer" and len(checkpoint_states) > 1:
+        print(f"\n执行 Checkpoint Averaging (平均最后 {len(checkpoint_states)} 个 checkpoints)...")
+        avg_state = {}
+        for key in checkpoint_states[0].keys():
+            avg_state[key] = torch.stack([s[key].float() for s in checkpoint_states]).mean(dim=0)
+        
+        # 保存平均后的模型
+        torch.save({
+            'epoch': num_epochs,
+            'model_state_dict': avg_state,
+            'val_loss': val_loss,
+        }, os.path.join(save_dir, f'{model_type}_averaged.pt'))
+        print(f"平均模型已保存到 {save_dir}/{model_type}_averaged.pt")
     
     # 保存训练历史
     with open(os.path.join(save_dir, f'{model_type}_history.json'), 'w') as f:
@@ -269,7 +300,7 @@ def main():
     NUM_EPOCHS = 20
     LEARNING_RATE = 0.001
     MIN_FREQ = 2
-    BPE_VOCAB_SIZE = 16000  # BPE词汇表大小（用于Transformer）
+    BPE_VOCAB_SIZE = 8000  # BPE词汇表大小（使用共享词表，小数据集使用较小词表）
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     print(f"使用设备: {DEVICE}")
@@ -323,38 +354,38 @@ def main():
     
     # ==================== 训练Transformer模型 ====================
     print("\n" + "=" * 60)
-    print("加载Transformer模型数据 (使用BPE分词)")
+    print("加载Transformer模型数据 (使用共享BPE分词)")
     print("=" * 60)
     
-    # Transformer使用BPE分词
-    train_loader_tf, val_loader_tf, test_loader_tf, src_tokenizer, tgt_tokenizer = create_dataloaders(
+    # Transformer使用共享BPE分词
+    train_loader_tf, val_loader_tf, test_loader_tf, tokenizer, _ = create_dataloaders(
         DATA_DIR, batch_size=BATCH_SIZE, model_type="transformer", bpe_vocab_size=BPE_VOCAB_SIZE
     )
     
-    # 保存Transformer分词器信息
+    # 保存Transformer分词器信息（共享词表）
     vocab_info_tf = {
-        "src_vocab_size": src_tokenizer.get_vocab_size(),
-        "tgt_vocab_size": tgt_tokenizer.get_vocab_size(),
+        "vocab_size": tokenizer.get_vocab_size(),
         "pad_idx": PAD_IDX,
         "bos_idx": BOS_IDX,
         "eos_idx": EOS_IDX,
-        "tokenizer_type": "bpe",
+        "tokenizer_type": "shared_bpe",
         "bpe_vocab_size": BPE_VOCAB_SIZE
     }
     with open("checkpoints/vocab_info_transformer.json", 'w') as f:
         json.dump(vocab_info_tf, f, indent=2)
     
-    # 保存BPE分词器
-    src_tokenizer.save("checkpoints/src_bpe_tokenizer.json")
-    tgt_tokenizer.save("checkpoints/tgt_bpe_tokenizer.json")
+    # 保存共享BPE分词器
+    tokenizer.save("checkpoints/shared_bpe_tokenizer.json")
     
     print("\n" + "=" * 60)
-    print("训练Transformer Seq2Seq模型 (BPE分词)")
+    print("训练Transformer Seq2Seq模型 (共享BPE分词)")
     print("=" * 60)
     
+    # 使用共享词表，src和tgt使用相同的vocab_size
+    vocab_size = tokenizer.get_vocab_size()
     transformer_model = TransformerSeq2Seq(
-        src_vocab_size=src_tokenizer.get_vocab_size(),
-        tgt_vocab_size=tgt_tokenizer.get_vocab_size(),
+        src_vocab_size=vocab_size,
+        tgt_vocab_size=vocab_size,
         d_model=256,
         nhead=8,
         num_encoder_layers=3,
