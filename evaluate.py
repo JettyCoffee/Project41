@@ -13,7 +13,7 @@ from collections import Counter
 import math
 
 from data_utils import (
-    create_dataloaders, Multi30kDatasetRNN, Multi30kDatasetTransformer,
+    create_dataloaders, SpaCy_RNN, BPE_Transformer,
     Vocabulary, BPETokenizerWrapper, PAD_IDX, BOS_IDX, EOS_IDX, collate_fn
 )
 from rnn_model import RNNSeq2Seq
@@ -334,7 +334,7 @@ def main():
         tgt_vocab = vocab_data['tgt_vocab']
         
         # 创建RNN测试数据集
-        test_dataset = Multi30kDatasetRNN(
+        test_dataset = SpaCy_RNN(
             os.path.join(DATA_DIR, "test.jsonl"),
             src_vocab=src_vocab,
             tgt_vocab=tgt_vocab
@@ -374,7 +374,7 @@ def main():
         tgt_tokenizer.load(tgt_bpe_path)
         
         # 创建Transformer测试数据集
-        test_dataset_tf = Multi30kDatasetTransformer(
+        test_dataset_tf = BPE_Transformer(
             os.path.join(DATA_DIR, "test.jsonl"),
             src_tokenizer=src_tokenizer,
             tgt_tokenizer=tgt_tokenizer

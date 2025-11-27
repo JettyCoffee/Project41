@@ -14,7 +14,7 @@ plt.rcParams['font.sans-serif'] = ['DejaVu Sans']  # 使用支持的字体
 plt.rcParams['axes.unicode_minus'] = False
 
 from typing import List, Dict, Optional
-from data_utils import create_dataloaders, Multi30kDataset, PAD_IDX, BOS_IDX, EOS_IDX
+from data_utils import create_dataloaders, SpaCy_RNN, BPE_Transformer, Vocabulary, BPETokenizerWrapper, PAD_IDX, BOS_IDX, EOS_IDX
 from rnn_model import RNNSeq2Seq
 from transformer_model import TransformerSeq2Seq
 
