@@ -12,7 +12,10 @@ from tqdm import tqdm
 from collections import Counter
 import math
 
-from data_utils import create_dataloaders, Multi30kDataset, Vocabulary, PAD_IDX, BOS_IDX, EOS_IDX
+from data_utils import (
+    create_dataloaders, Multi30kDatasetRNN, Multi30kDatasetTransformer,
+    Vocabulary, BPETokenizerWrapper, PAD_IDX, BOS_IDX, EOS_IDX, collate_fn
+)
 from rnn_model import RNNSeq2Seq
 from transformer_model import TransformerSeq2Seq
 
@@ -174,10 +177,17 @@ def calculate_bertscore(candidates: List[str], references: List[str],
         }
 
 
-def generate_translations(model, dataloader, src_vocab: Vocabulary, tgt_vocab: Vocabulary,
-                          device: torch.device, model_type: str) -> Tuple[List[List[str]], List[List[str]], List[str], List[str]]:
+def generate_translations(model, dataloader, tgt_tokenizer, device: torch.device, 
+                          model_type: str, tokenizer_type: str = "vocab") -> Tuple[List[List[str]], List[List[str]], List[str], List[str]]:
     """
     生成翻译
+    Args:
+        model: 模型
+        dataloader: 数据加载器
+        tgt_tokenizer: 目标语言分词器（Vocabulary或BPETokenizerWrapper）
+        device: 设备
+        model_type: 模型类型
+        tokenizer_type: 分词器类型，"vocab"或"bpe"
     Returns:
         (候选token列表, 参考token列表, 候选字符串列表, 参考字符串列表)
     """
@@ -200,22 +210,32 @@ def generate_translations(model, dataloader, src_vocab: Vocabulary, tgt_vocab: V
             for i in range(src.size(0)):
                 # 候选翻译
                 cand_indices = outputs[i].tolist()
-                cand_tokens = tgt_vocab.decode(cand_indices, remove_special=True)
-                
                 # 参考翻译
                 ref_indices = tgt[i].tolist()
-                ref_tokens = tgt_vocab.decode(ref_indices, remove_special=True)
+                
+                if tokenizer_type == "vocab":
+                    # 使用Vocabulary解码
+                    cand_tokens = tgt_tokenizer.decode(cand_indices, remove_special=True)
+                    ref_tokens = tgt_tokenizer.decode(ref_indices, remove_special=True)
+                    cand_str = ' '.join(cand_tokens)
+                    ref_str = ' '.join(ref_tokens)
+                else:
+                    # 使用BPE解码
+                    cand_str = tgt_tokenizer.decode(cand_indices, remove_special=True)
+                    ref_str = tgt_tokenizer.decode(ref_indices, remove_special=True)
+                    cand_tokens = cand_str.split()
+                    ref_tokens = ref_str.split()
                 
                 all_candidates_tokens.append(cand_tokens)
                 all_references_tokens.append(ref_tokens)
-                all_candidates_str.append(' '.join(cand_tokens))
-                all_references_str.append(' '.join(ref_tokens))
+                all_candidates_str.append(cand_str)
+                all_references_str.append(ref_str)
     
     return all_candidates_tokens, all_references_tokens, all_candidates_str, all_references_str
 
 
-def evaluate_model(model, test_loader, src_vocab: Vocabulary, tgt_vocab: Vocabulary,
-                   device: torch.device, model_type: str, 
+def evaluate_model(model, test_loader, tgt_tokenizer, device: torch.device, 
+                   model_type: str, tokenizer_type: str = "vocab",
                    bertscore_model: str = "microsoft/deberta-large-mnli") -> Dict:
     """
     完整评估模型
@@ -224,7 +244,7 @@ def evaluate_model(model, test_loader, src_vocab: Vocabulary, tgt_vocab: Vocabul
     
     # 生成翻译
     cand_tokens, ref_tokens, cand_str, ref_str = generate_translations(
-        model, test_loader, src_vocab, tgt_vocab, device, model_type
+        model, test_loader, tgt_tokenizer, device, model_type, tokenizer_type
     )
     
     # 计算BLEU
@@ -295,39 +315,37 @@ def main():
     # 创建结果目录
     os.makedirs(RESULTS_DIR, exist_ok=True)
     
-    # 加载词汇表
-    print("\n加载词汇表...")
-    vocab_data = torch.load(os.path.join(CHECKPOINT_DIR, "vocab.pt"), weights_only=False)
-    src_vocab = vocab_data['src_vocab']
-    tgt_vocab = vocab_data['tgt_vocab']
-    
-    # 加载测试数据
-    print("加载测试数据...")
-    _, _, test_loader, _, _ = create_dataloaders(DATA_DIR, batch_size=BATCH_SIZE)
-    
-    # 但是需要用保存的词汇表重新创建test_loader
-    test_dataset = Multi30kDataset(
-        os.path.join(DATA_DIR, "test.jsonl"),
-        src_vocab=src_vocab,
-        tgt_vocab=tgt_vocab
-    )
-    from torch.utils.data import DataLoader
-    from data_utils import collate_fn
-    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
-    
     all_results = {}
     all_samples = {}
     
     # ==================== 评估RNN模型 ====================
     print("\n" + "=" * 60)
-    print("评估RNN模型")
+    print("评估RNN模型 (spaCy分词)")
     print("=" * 60)
     
     rnn_model_path = os.path.join(CHECKPOINT_DIR, "rnn_best.pt")
-    if os.path.exists(rnn_model_path):
+    rnn_vocab_path = os.path.join(CHECKPOINT_DIR, "vocab_rnn.pt")
+    
+    if os.path.exists(rnn_model_path) and os.path.exists(rnn_vocab_path):
+        # 加载RNN词汇表
+        print("\n加载RNN词汇表...")
+        vocab_data = torch.load(rnn_vocab_path, weights_only=False)
+        src_vocab = vocab_data['src_vocab']
+        tgt_vocab = vocab_data['tgt_vocab']
+        
+        # 创建RNN测试数据集
+        test_dataset = Multi30kDatasetRNN(
+            os.path.join(DATA_DIR, "test.jsonl"),
+            src_vocab=src_vocab,
+            tgt_vocab=tgt_vocab
+        )
+        from torch.utils.data import DataLoader
+        test_loader_rnn = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
+        
+        # 加载模型
         rnn_model = load_model(rnn_model_path, "rnn", len(src_vocab), len(tgt_vocab), DEVICE)
         rnn_results, rnn_cands, rnn_refs = evaluate_model(
-            rnn_model, test_loader, src_vocab, tgt_vocab, DEVICE, "rnn"
+            rnn_model, test_loader_rnn, tgt_vocab, DEVICE, "rnn", tokenizer_type="vocab"
         )
         all_results["RNN"] = rnn_results
         all_samples["RNN"] = {"candidates": rnn_cands[:20], "references": rnn_refs[:20]}
@@ -336,20 +354,41 @@ def main():
         for k, v in rnn_results.items():
             print(f"  {k}: {v:.4f}")
     else:
-        print(f"未找到RNN模型: {rnn_model_path}")
+        print(f"未找到RNN模型或词汇表")
     
     # ==================== 评估Transformer模型 ====================
     print("\n" + "=" * 60)
-    print("评估Transformer模型")
+    print("评估Transformer模型 (BPE分词)")
     print("=" * 60)
     
     transformer_model_path = os.path.join(CHECKPOINT_DIR, "transformer_best.pt")
-    if os.path.exists(transformer_model_path):
+    src_bpe_path = os.path.join(CHECKPOINT_DIR, "src_bpe_tokenizer.json")
+    tgt_bpe_path = os.path.join(CHECKPOINT_DIR, "tgt_bpe_tokenizer.json")
+    
+    if os.path.exists(transformer_model_path) and os.path.exists(src_bpe_path) and os.path.exists(tgt_bpe_path):
+        # 加载BPE分词器
+        print("\n加载BPE分词器...")
+        src_tokenizer = BPETokenizerWrapper()
+        tgt_tokenizer = BPETokenizerWrapper()
+        src_tokenizer.load(src_bpe_path)
+        tgt_tokenizer.load(tgt_bpe_path)
+        
+        # 创建Transformer测试数据集
+        test_dataset_tf = Multi30kDatasetTransformer(
+            os.path.join(DATA_DIR, "test.jsonl"),
+            src_tokenizer=src_tokenizer,
+            tgt_tokenizer=tgt_tokenizer
+        )
+        from torch.utils.data import DataLoader
+        test_loader_tf = DataLoader(test_dataset_tf, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
+        
+        # 加载模型
         transformer_model = load_model(
-            transformer_model_path, "transformer", len(src_vocab), len(tgt_vocab), DEVICE
+            transformer_model_path, "transformer", 
+            src_tokenizer.get_vocab_size(), tgt_tokenizer.get_vocab_size(), DEVICE
         )
         transformer_results, trans_cands, trans_refs = evaluate_model(
-            transformer_model, test_loader, src_vocab, tgt_vocab, DEVICE, "transformer"
+            transformer_model, test_loader_tf, tgt_tokenizer, DEVICE, "transformer", tokenizer_type="bpe"
         )
         all_results["Transformer"] = transformer_results
         all_samples["Transformer"] = {"candidates": trans_cands[:20], "references": trans_refs[:20]}
@@ -358,7 +397,7 @@ def main():
         for k, v in transformer_results.items():
             print(f"  {k}: {v:.4f}")
     else:
-        print(f"未找到Transformer模型: {transformer_model_path}")
+        print(f"未找到Transformer模型或BPE分词器")
     
     # ==================== 保存结果 ====================
     with open(os.path.join(RESULTS_DIR, "evaluation_results.json"), 'w') as f:
@@ -374,14 +413,14 @@ def main():
         print("=" * 60)
         
         metrics = list(all_results["RNN"].keys())
-        print(f"\n{'指标':<20} {'RNN':<15} {'Transformer':<15} {'差异':<15}")
-        print("-" * 65)
+        print(f"\n{'指标':<20} {'RNN (spaCy)':<15} {'Transformer (BPE)':<18} {'差异':<15}")
+        print("-" * 68)
         for metric in metrics:
             rnn_val = all_results["RNN"][metric]
             trans_val = all_results["Transformer"][metric]
             diff = trans_val - rnn_val
             diff_str = f"+{diff:.4f}" if diff > 0 else f"{diff:.4f}"
-            print(f"{metric:<20} {rnn_val:<15.4f} {trans_val:<15.4f} {diff_str:<15}")
+            print(f"{metric:<20} {rnn_val:<15.4f} {trans_val:<18.4f} {diff_str:<15}")
     
     print(f"\n结果已保存到 {RESULTS_DIR}/")
 
